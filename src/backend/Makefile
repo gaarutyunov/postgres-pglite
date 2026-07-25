@@ -94,6 +94,7 @@ postgres: $(OBJS)
 endif
 endif
 endif
+endif
 
 ifeq ($(PORTNAME), emscripten)
 
