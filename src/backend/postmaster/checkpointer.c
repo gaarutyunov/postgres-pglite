@@ -1075,7 +1075,9 @@ RequestCheckpoint(int flags)
 	/*
 	 * If in a standalone backend, just do it ourselves.
 	 */
+#ifndef __PGLITE__	
 	if (!IsPostmasterEnvironment)
+#endif
 	{
 		/*
 		 * There's no point in doing slow checkpoints in a standalone backend,
