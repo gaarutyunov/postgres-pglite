@@ -205,9 +205,10 @@ static void disable_statement_timeout(void);
 
 /* these must be volatile to ensure state is preserved across longjmp: */
 #ifdef __PGLITE__
+/* owned by pglitec.c, which drives the loop and so must reach this flag */
 extern bool send_ready_for_query;
 #else
-bool		send_ready_for_query = false;
+static bool send_ready_for_query = false;
 #endif
 
 static volatile bool idle_in_transaction_timeout_enabled = false;
