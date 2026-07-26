@@ -84,6 +84,16 @@ pg_noreturn extern void PostgresSingleUserMain(int argc, char *argv[],
 											   const char *username);
 pg_noreturn extern void PostgresMain(const char *dbname,
 									 const char *username);
+
+/*
+ * Pieces of PostgresMain's message loop, exposed so the PGlite Emscripten
+ * driver can run the backend one message at a time: a browser cannot block the
+ * main thread, so it drives these rather than letting PostgresMain sit in
+ * ReadCommand.  A normal build reaches them only through PostgresMain.
+ */
+extern void PostgresSendReadyForQueryIfNecessary(void);
+extern void PostgresMainLoopOnce(void);
+
 extern void ResetUsage(void);
 extern void ShowUsage(const char *title);
 extern int	check_log_duration(char *msec_str, bool was_logged);
