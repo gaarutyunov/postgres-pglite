@@ -155,7 +155,11 @@ static bool DoingCommandRead = false;
  * the extended query protocol.
  */
 static bool doing_extended_query_message = false;
+#ifdef __PGLITE__
+extern bool ignore_till_sync;
+#else
 static bool ignore_till_sync = false;
+#endif
 
 /*
  * If an unnamed prepared statement exists, it's stored here.
@@ -198,6 +202,119 @@ static void report_recovery_conflict(RecoveryConflictReason reason);
 static void log_disconnections(int code, Datum arg);
 static void enable_statement_timeout(void);
 static void disable_statement_timeout(void);
+
+#ifdef __PGLITE__
+
+#include <netinet/in.h>
+
+#include "libpq/auth.h"
+#include "libpq/hba.h"
+#include "libpq/pqcomm.h"
+
+#define PGLITE_EXIT_ALIVE 99
+
+extern sigjmp_buf postgresmain_sigjmp_buf;
+extern int	pgl_sigsetjmp(sigjmp_buf env, int savesigs);
+extern int	is_pglite_active;
+
+void
+initDummyPort(void)
+{
+	ClientSocket s;
+	struct sockaddr_in *addr;
+	MemoryContext oldcontext;
+
+	/* Switch to TopMemoryContext so the Port survives MessageContext resets */
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+	s.sock = 1;
+
+	/* Set up a valid-looking localhost address */
+	memset(&s.raddr, 0, sizeof(s.raddr));
+	addr = (struct sockaddr_in *) &s.raddr.addr;
+	addr->sin_family = AF_INET;
+	addr->sin_port = htons(5432);
+	addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	s.raddr.salen = sizeof(struct sockaddr_in);
+
+	MyProcPort = pq_init(&s);
+
+	MemoryContextSwitchTo(oldcontext);
+}
+
+void
+pgl_startPGlite(void)
+{
+	initDummyPort();
+	whereToSendOutput = DestRemote;
+
+	/*
+	 * initdb execs postgres in single-user mode, which sets ExitOnAnyError;
+	 * that does not play well with the longjmp trick, so clear it.
+	 */
+	ExitOnAnyError = false;
+	MyBackendType = B_BACKEND;
+	IsPostmasterEnvironment = true;
+	IsUnderPostmaster = true;
+
+	if (!load_hba())
+	{
+		/*
+		 * It makes no sense to continue if we fail to load the HBA file,
+		 * since there is no way to connect to the database in this case.
+		 */
+		ereport(FATAL,
+		/* translator: %s is a configuration file */
+				(errmsg("could not load %s", HbaFileName)));
+	}
+}
+
+void
+pgl_pq_flush(void)
+{
+	pq_flush();
+}
+
+struct Port *
+pgl_getMyProcPort(void)
+{
+	return MyProcPort;
+}
+
+void
+pgl_sendConnData(void)
+{
+	ClientAuthInProgress = false;
+
+	{
+		StringInfoData buf;
+
+		pq_beginmessage(&buf, PqMsg_AuthenticationRequest);
+		pq_sendint32(&buf, (int32) AUTH_REQ_OK);
+		pq_endmessage(&buf);
+	}
+
+	BeginReportingGUCOptions();
+	pgstat_report_connect(MyDatabaseId);
+
+	{
+		StringInfoData buf;
+
+		/*
+		 * PG19 carries a variable-length cancel key (protocol 3.2), so the
+		 * key is sent as bytes rather than a single int32.
+		 */
+		Assert(MyCancelKeyLength > 0);
+		pq_beginmessage(&buf, PqMsg_BackendKeyData);
+		pq_sendint32(&buf, (int32) MyProcPid);
+		pq_sendbytes(&buf, MyCancelKey, MyCancelKeyLength);
+		pq_endmessage(&buf);
+	}
+
+	ReadyForQuery(DestRemote);
+}
+
+#endif							/* __PGLITE__ */
 
 
 /* ----------------------------------------------------------------
