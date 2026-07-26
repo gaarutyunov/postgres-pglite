@@ -93,6 +93,7 @@ pg_noreturn extern void PostgresMain(const char *dbname,
  */
 extern void PostgresSendReadyForQueryIfNecessary(void);
 extern void PostgresMainLoopOnce(void);
+extern void PostgresMainLongJmp(void);
 
 extern void ResetUsage(void);
 extern void ShowUsage(const char *title);
