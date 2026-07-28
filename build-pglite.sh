@@ -125,12 +125,21 @@ emmake make PORTNAME=emscripten install || { echo 'error: emmake make PORTNAME=e
 # Step 3.1: make ported contrib extensions - do not install
 emmake make PORTNAME=emscripten -C contrib/ -j || { echo 'error: emmake make PORTNAME=emscripten -C contrib/ -j' ; exit 31; }
 
-# Step 3.2 pgcrypto - special case
+# Step 3.2 pgcrypto - special case. Retained under the core-only scope: pgcrypto
+# is a standard contrib/ extension, and step 3.1 does not build it. ./configure
+# runs with --with-openssl=no above, so contrib/Makefile puts pgcrypto in
+# ALWAYS_SUBDIRS instead of SUBDIRS; this step is the only thing that compiles
+# it, and it is what links libssl/libcrypto in with --whole-archive.
 cd ./pglite && ./build-pgcrypto.sh && cd ../
 
 # Step 3.3: make dist contrib extensions - this will create an archive for each extension
+# Also retained: contrib/dist.mk packages $(SUBDIRS) from contrib/Makefile and
+# never referenced the removed pglite/other_extensions tree, which carried its
+# own parallel copy of this dist logic. PGLITE_WITH_PGCRYPTO=1 adds pgcrypto to
+# SUBDIRS so that step 3.2's output is packaged along with the rest.
 PGLITE_WITH_PGCRYPTO=1 emmake make PORTNAME=emscripten -C contrib/ dist || { echo 'error: emmake make PORTNAME=emscripten -C contrib/ dist' ; exit 32; }
 # the above will also create a file with the imports that each extension needs - we pass these as input in the next step for emscripten to keep alive
+# (this is the only producer of those .imports files, so step 5 depends on it)
 
 # Step 4: removed - this fork is core-only, so there are no out-of-tree extensions
 # to build. Standard contrib/ extensions are still built by step 3 above; the
