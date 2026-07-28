@@ -104,6 +104,12 @@ postgres: $(OBJS)
 # Extensions use functions from the core PG. These need to be exported by the emscripten compiler.
 # The following target gathers all extension imports + the default ones (included.pglite.imports),
 # excludes the one in excluded.pglite.imports and adds a leading _ to each.
+# The exclusion list only names libraries the builder image actually ships. The
+# PostGIS-chain entries (libjson-c, libdeflate, libtiff, libsqlite3, libproj,
+# libgeos) went with those libraries. Keeping them would not have failed the
+# build - cat's exit status is swallowed by the pipe - but it would have printed
+# six "No such file or directory" errors per run. The generated output is
+# unchanged: no in-tree contrib extension imports symbols from those libraries.
 pglite-exported-functions:
 	$(MKDIR_P) /install/pglite
 	cat $(top_builddir)/pglite/static/excluded.pglite.exports \
@@ -111,12 +117,6 @@ pglite-exported-functions:
 	$(LIB_EXPORTS_DIR)/libossp-uuid.exports \
 	$(LIB_EXPORTS_DIR)/libssl.exports \
 	$(LIB_EXPORTS_DIR)/libcrypto.exports \
-	$(LIB_EXPORTS_DIR)/libjson-c.exports \
-	$(LIB_EXPORTS_DIR)/libdeflate.exports \
-	$(LIB_EXPORTS_DIR)/libtiff.exports \
-	$(LIB_EXPORTS_DIR)/libsqlite3.exports \
-	$(LIB_EXPORTS_DIR)/libproj.exports \
-	$(LIB_EXPORTS_DIR)/libgeos.exports \
 	| sort -u > '/install/pglite/excluded.imports.gen'
 	cat $(DESTDIR)$(emscripten_extension_imports_dir)/*.imports '$(top_builddir)/pglite/static/included.pglite.exports' | \
 	sort -u | \
