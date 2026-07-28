@@ -132,15 +132,14 @@ cd ./pglite && ./build-pgcrypto.sh && cd ../
 PGLITE_WITH_PGCRYPTO=1 emmake make PORTNAME=emscripten -C contrib/ dist || { echo 'error: emmake make PORTNAME=emscripten -C contrib/ dist' ; exit 32; }
 # the above will also create a file with the imports that each extension needs - we pass these as input in the next step for emscripten to keep alive
 
-# Step 4: make and dist other extensions
-SAVE_PATH=$PATH
-PATH=$PATH:$INSTALL_FOLDER/bin
-emmake make OPTFLAGS="" PORTNAME=emscripten -C pglite/other_extensions -j || { echo 'emmake make OPTFLAGS="" PORTNAME=emscripten -j -C pglite/other_extensions' ; exit 41; }
-# Step 4.1: special case: make PostGIS
-cd ./pglite/ && ./build-postgis.sh && cd ../
-emmake make OPTFLAGS="" PORTNAME=emscripten -C pglite/other_extensions dist || { echo 'emmake make OPTFLAGS="" PORTNAME=emscripten -C pglite/other_extensions dist' ; exit 42; }
-emmake make OPTFLAGS="" PORTNAME=emscripten -C pglite/other_extensions dist-postgis || { echo 'emmake make OPTFLAGS="" PORTNAME=emscripten -C pglite/ dist-postgis' ; exit 43; }
-PATH=$SAVE_PATH
+# Step 4: removed - this fork is core-only, so there are no out-of-tree extensions
+# to build. Standard contrib/ extensions are still built by step 3 above; the
+# extensions this step used to build (pg_ivm, vector, pgtap, age, pg_uuidv7,
+# pg_hashids, pg_textsearch, pgmq, postgis) are not part of this fork.
+# Exit codes 41, 42 and 43 are retired with it. The steps below keep their
+# original numbers on purpose: the first digit of every exit code is its step
+# number, so renumbering here would change the failure codes of steps that this
+# change does not otherwise touch.
 
 # Step 5: get exported functions
 emmake make PORTNAME=emscripten -j -C src/backend pglite-exported-functions || { echo 'emmake make PORTNAME=emscripten -j -C src/backend pglite-exported-functions' ; exit 51; }
