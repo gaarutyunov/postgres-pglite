@@ -110,6 +110,12 @@ postgres: $(OBJS)
 # build - cat's exit status is swallowed by the pipe - but it would have printed
 # six "No such file or directory" errors per run. The generated output is
 # unchanged: no in-tree contrib extension imports symbols from those libraries.
+# The cat below is deliberately NOT piped straight into sort: a pipeline takes
+# its exit status from the last command, so a missing input used to vanish
+# silently and leave the exclusion list short. That is how a missing
+# excluded.pglite.exports went unnoticed until it surfaced, much later and much
+# less legibly, as an undefined exported symbol at the step 6 link. Keeping cat
+# as its own recipe line makes make fail on the spot instead.
 pglite-exported-functions:
 	$(MKDIR_P) /install/pglite
 	cat $(top_builddir)/pglite/static/excluded.pglite.exports \
@@ -117,7 +123,8 @@ pglite-exported-functions:
 	$(LIB_EXPORTS_DIR)/libossp-uuid.exports \
 	$(LIB_EXPORTS_DIR)/libssl.exports \
 	$(LIB_EXPORTS_DIR)/libcrypto.exports \
-	| sort -u > '/install/pglite/excluded.imports.gen'
+	> '/install/pglite/excluded.imports.cat'
+	sort -u '/install/pglite/excluded.imports.cat' > '/install/pglite/excluded.imports.gen'
 	cat $(DESTDIR)$(emscripten_extension_imports_dir)/*.imports '$(top_builddir)/pglite/static/included.pglite.exports' | \
 	sort -u | \
 	grep -v -E '^(invoke_|__indirect_function_table)' | \
