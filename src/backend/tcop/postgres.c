@@ -225,7 +225,6 @@ static volatile bool idle_session_timeout_enabled = false;
 #define PGLITE_EXIT_ALIVE 99
 
 extern sigjmp_buf postgresmain_sigjmp_buf;
-extern int	pgl_sigsetjmp(sigjmp_buf env, int savesigs);
 extern int	is_pglite_active;
 
 void
@@ -5272,8 +5271,17 @@ PostgresMain(const char *dbname, const char *username)
 	 * PGlite drives the loop from JS and returns between messages, so the
 	 * jump target cannot live in this frame -- by the time an error longjmps,
 	 * PostgresMain has returned and the frame is gone.  postgresmain_sigjmp_buf
-	 * is file scope for exactly that reason, and pgl_sigsetjmp is the
-	 * Emscripten-aware setjmp.
+	 * is file scope for exactly that reason.
+	 *
+	 * The setjmp side is plain sigsetjmp: Emscripten's own sigsetjmp already
+	 * behaves correctly, so build-pglite.sh deliberately leaves it unremapped
+	 * ("we don't want to override sigsetjmp and setjmp!").  Only the jump side
+	 * is wrapped -- -Dlongjmp=pgl_longjmp / -Dsiglongjmp=pgl_siglongjmp route
+	 * it to pglitec.c, which recognises a jump aimed at this buffer and exits
+	 * with POSTGRES_MAIN_LONGJMP so JS can re-enter, rather than unwinding a
+	 * frame that no longer exists.  There is no pgl_sigsetjmp anywhere, and
+	 * calling one only linked because of -sERROR_ON_UNDEFINED_SYMBOLS=0; the
+	 * emitted stub called itself and blew the stack before the first query.
 	 *
 	 * Fenced rather than unconditional: the upstream delta sets
 	 * postgresmain_sigjmp_buf but then points PG_exception_stack at
@@ -5283,7 +5291,7 @@ PostgresMain(const char *dbname, const char *username)
 	 * PG19's behaviour exactly.
 	 */
 #ifdef __PGLITE__
-	if (pgl_sigsetjmp(postgresmain_sigjmp_buf, 1) != 0)
+	if (sigsetjmp(postgresmain_sigjmp_buf, 1) != 0)
 #else
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 #endif
