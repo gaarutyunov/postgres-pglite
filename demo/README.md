@@ -58,6 +58,19 @@ node site/verify.mjs site/pglite
 It exits non-zero if any statement errors, if a `GRAPH_TABLE` query returns no
 rows, or if the server is not PostgreSQL 19.
 
+To prove the browser path specifically — module workers, `fetch`, and browser
+WebAssembly instantiation are not the same code path as Node:
+
+```sh
+(cd site && python3 -m http.server 8899 &)
+python3 site/browser-check.py http://localhost:8899/
+```
+
+It drives headless Chrome over the DevTools Protocol and reports what the page
+rendered. `--dump-dom` is no substitute: it fires on the load event, long before
+the worker has booted Postgres, and reports an empty page. Both checks run in
+CI on every push.
+
 ## Layout
 
 | File | What it is |
@@ -65,7 +78,8 @@ rows, or if the server is not PostgreSQL 19.
 | `demo.sql` | The hand-written schema, seed rows and graph queries |
 | `worker.js` | Owns the PGlite instance; the only place SQL is executed |
 | `app.js` | Renders what the worker reports; contains no SQL |
-| `verify.mjs` | The headless gate CI runs |
+| `verify.mjs` | The Node gate CI runs |
+| `browser-check.py` | The real-browser gate CI runs (CDP, stdlib only) |
 | `index.html`, `style.css` | The page |
 
 `pglite/` and `build-info.json` are build output and are gitignored.

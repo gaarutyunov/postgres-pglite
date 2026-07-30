@@ -229,7 +229,8 @@ jobs:
         run: |
           mkdir -p site
           cp repo/demo/index.html repo/demo/app.js repo/demo/worker.js \
-             repo/demo/style.css repo/demo/demo.sql repo/demo/verify.mjs site/
+             repo/demo/style.css repo/demo/demo.sql repo/demo/verify.mjs \
+             repo/demo/browser-check.py site/
           cp -r pglite-js/packages/pglite/dist site/pglite
           cat > site/build-info.json <<JSON
           {
@@ -242,8 +243,22 @@ jobs:
           JSON
           du -sh site site/pglite
 
-      - name: Prove the engine executes GRAPH_TABLE (headless)
+      - name: Prove the engine executes GRAPH_TABLE (Node)
         run: node site/verify.mjs site/pglite
+
+      - name: Prove it again in a real browser
+        run: |
+          # Node and the browser are different paths — the browser adds module
+          # workers, fetch and browser WebAssembly instantiation — and the
+          # browser is the one issue #28 actually asks about. Serve the site
+          # exactly as the preview will, with no special headers, which also
+          # demonstrates that -sUSE_PTHREADS=0 leaves COOP/COEP unnecessary.
+          (cd site && python3 -m http.server 8899 >/dev/null 2>&1 &)
+          for _ in $(seq 1 20); do
+            curl -sf http://localhost:8899/ >/dev/null && break
+            sleep 1
+          done
+          python3 site/browser-check.py http://localhost:8899/
 
       - name: Upload the preview site
         uses: actions/upload-artifact@v7
