@@ -95,3 +95,21 @@ what PGlite's own `wasm:copy-pglite` script does with `dist/bin/`.
 
 This matters for anyone consuming the release: the `.wasm` and the FS bundle
 alone are not loadable. The matching glue has to travel with them.
+
+That is why the release's primary asset is an **npm package tarball** of
+`@electric-sql/pglite` — same package name, so
+`import { PGlite } from '@electric-sql/pglite'` is a drop-in — pinned by URL and
+verified against the published `SHA256SUMS`. The raw `.wasm` and `.data` are
+published too, but only for inspection.
+
+## The build is byte-deterministic
+
+Four independent CI runs on different runners produced identical `pglite.wasm`
+and `pglite.data`, confirmed by sha256 and by `gh-pages` holding a single git
+blob across every deploy.
+
+That is what makes it affordable for each PR preview to carry its own full copy
+of the runtime rather than sharing one published copy: a preview has to exercise
+the bytes its own run built, and identical bytes cost one blob no matter how
+many previews reference them. Previews for closed and merged PRs are pruned on
+each deploy, so the directories do not accumulate.
