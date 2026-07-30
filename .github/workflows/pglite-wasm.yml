@@ -15,10 +15,17 @@ name: PGlite wasm32 build and SQL/PGQ demo
 # so that mistake cannot pass silently.
 
 on:
-  pull_request:
+  # This repository is a fork, and every workflow run it has ever had came from
+  # a `push` event — a `pull_request` push to a branch here produced no run at
+  # all. So `push` is the trigger that is actually known to work; the
+  # `pull_request` entry is kept because it costs nothing if it does fire.
   push:
+    branches:
+      - 'issue-**'
+      - 'REL_19_BETA2-pglite'
     tags:
       - 'pglite-wasm-*'
+  pull_request:
   workflow_dispatch:
     inputs:
       build_ref:
@@ -229,13 +236,36 @@ jobs:
           if-no-files-found: error
 
   preview:
-    name: Publish PR preview
+    name: Publish preview
     needs: demo
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Work out where the preview goes
+        id: slug
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # On a pull_request run the PR number is handed to us. On a push run
+          # it is not, so ask for the PR whose head is this branch; if there
+          # isn't one, fall back to the branch name.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SLUG="pr-${{ github.event.number }}"
+          else
+            PR=$(gh pr list --repo "${{ github.repository }}" \
+                   --head "${{ github.ref_name }}" --state open \
+                   --json number --jq '.[0].number // empty')
+            if [ -n "$PR" ]; then
+              SLUG="pr-${PR}"
+            else
+              SLUG="branch-$(echo "${{ github.ref_name }}" | tr -c 'A-Za-z0-9._-' '-')"
+            fi
+          fi
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "Preview path: $SLUG"
+
       - uses: actions/checkout@v4
         with:
           ref: gh-pages
@@ -255,11 +285,11 @@ jobs:
           name: demo-site
           path: incoming
 
-      - name: Place the preview under pr-${{ github.event.number }}/
+      - name: Place the preview under ${{ steps.slug.outputs.slug }}/
         run: |
-          rm -rf "pages/pr-${{ github.event.number }}"
-          mkdir -p "pages/pr-${{ github.event.number }}"
-          cp -r incoming/. "pages/pr-${{ github.event.number }}/"
+          rm -rf "pages/${{ steps.slug.outputs.slug }}"
+          mkdir -p "pages/${{ steps.slug.outputs.slug }}"
+          cp -r incoming/. "pages/${{ steps.slug.outputs.slug }}/"
           # Jekyll would swallow files and directories beginning with an
           # underscore, which emscripten output can contain.
           touch pages/.nojekyll
@@ -270,20 +300,22 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "preview: PR #${{ github.event.number }} @ ${{ github.sha }}" || {
+          git commit -m "preview: ${{ steps.slug.outputs.slug }} @ ${{ github.sha }}" || {
             echo "nothing to publish"; exit 0;
           }
-          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:gh-pages
 
       - name: Report the preview URL
         run: |
           OWNER=$(echo "${{ github.repository }}" | cut -d/ -f1)
           NAME=$(echo "${{ github.repository }}" | cut -d/ -f2)
-          echo "### SQL/PGQ demo preview" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "https://${OWNER}.github.io/${NAME}/pr-${{ github.event.number }}/" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "(GitHub Pages must be enabled for this repository with the \`gh-pages\` branch as its source.)" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### SQL/PGQ demo preview"
+            echo ""
+            echo "https://${OWNER}.github.io/${NAME}/${{ steps.slug.outputs.slug }}/"
+            echo ""
+            echo "(GitHub Pages must be enabled for this repository with the \`gh-pages\` branch as its source.)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
     name: Attach the bundle to the release
