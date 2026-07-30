@@ -13,6 +13,21 @@ name: PGlite wasm32 build and SQL/PGQ demo
 # SQL/PGQ whatsoever, so a bundle built from it cannot run a single query in
 # demo/demo.sql. verify.mjs asserts the server reports PostgreSQL 19 precisely
 # so that mistake cannot pass silently.
+#
+# NO "RUN WORKFLOW" BUTTON, AND WHY: this file lives on REL_19_BETA2-pglite, not
+# on the repository's default branch. GitHub only surfaces `workflow_dispatch`
+# for workflows present on the *default* branch, so the Actions UI will show no
+# manual-run button for this workflow and the `build_ref` input below is not
+# reachable from the UI. This is expected, not a misconfiguration.
+#
+# What still works meanwhile: every push to REL_19_BETA2-pglite or an issue-**
+# branch triggers a full build, demo and preview automatically, and pushing a
+# `pglite-wasm-*` tag still runs the release path. Only *choosing a different
+# build_ref by hand* is unavailable.
+#
+# It resolves itself when postgres-pglite#10 re-pins the fork at PG19 GA and 19
+# becomes the default branch; the dispatch button then appears with no change
+# to this file.
 
 on:
   # This repository is a fork, and every workflow run it has ever had came from
