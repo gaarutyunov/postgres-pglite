@@ -69,7 +69,7 @@ jobs:
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
       - name: Check out the fork at ${{ steps.ref.outputs.ref }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.ref.outputs.ref }}
           path: fork
@@ -145,13 +145,16 @@ jobs:
           test -f dist/bin/pglite.data || { echo "::error::no pglite.data produced"; exit 1; }
           test -f dist/bin/pglite.js   || { echo "::error::no pglite.js produced";   exit 1; }
 
+          # initdb is a separate emscripten module. PGlite runs it once to
+          # create the data directory, and packages/pglite/src/initdbModFactory.ts
+          # imports ../release/initdb at *build* time, so a missing initdb.js
+          # breaks the JS build rather than failing later at runtime.
+          test -f dist/bin/initdb.wasm || { echo "::error::no initdb.wasm produced"; exit 1; }
+          test -f dist/bin/initdb.js   || { echo "::error::no initdb.js produced";   exit 1; }
+
           mkdir -p ../bundle
           cp dist/bin/pglite.js dist/bin/pglite.wasm dist/bin/pglite.data ../bundle/
-          # initdb is a separate emscripten module; PGlite runs it once to
-          # create the in-memory data directory, so the bundle is unusable
-          # without it.
-          cp dist/bin/initdb.js dist/bin/initdb.wasm ../bundle/ 2>/dev/null || \
-            echo "::warning::no separate initdb module in this build"
+          cp dist/bin/initdb.js dist/bin/initdb.wasm ../bundle/
           mkdir -p ../bundle/extensions
           cp dist/extensions/*.tar.gz ../bundle/extensions/ 2>/dev/null || true
 
@@ -159,7 +162,7 @@ jobs:
           du -sh ../bundle
 
       - name: Upload the bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pglite-wasm32
           path: bundle
@@ -173,18 +176,23 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out this branch (the demo sources)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: repo
           fetch-depth: 1
 
       - name: Download the wasm bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pglite-wasm32
           path: bundle
 
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v5
+        with:
+          # Matches the `packageManager` field in pglite's root package.json.
+          version: 9.7.0
+
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
 
@@ -196,16 +204,26 @@ jobs:
 
       - name: Build the JS runtime against OUR wasm
         run: |
-          npm install -g pnpm@9
           mkdir -p pglite-js/packages/pglite/release
           # These are exactly the files pglite's own `wasm:copy-pglite` /
           # `wasm:copy-initdb` scripts take from postgres-pglite/dist/bin.
           cp bundle/pglite.js bundle/pglite.wasm bundle/pglite.data pglite-js/packages/pglite/release/
-          cp bundle/initdb.js bundle/initdb.wasm pglite-js/packages/pglite/release/ 2>/dev/null || true
+          cp bundle/initdb.js bundle/initdb.wasm pglite-js/packages/pglite/release/
+          # contrib bundles are runtime-only (referenced by URL, not imported),
+          # so the demo builds fine without them.
           cp bundle/extensions/*.tar.gz pglite-js/packages/pglite/release/ 2>/dev/null || true
           cd pglite-js
           pnpm install --frozen-lockfile
-          pnpm --filter @electric-sql/pglite build:js
+          # Same order pglite's own CI uses: the two workspace dependencies
+          # first, then pglite itself.
+          pnpm --filter "@electric-sql/pglite-utils" build
+          pnpm --filter "@electric-sql/pg-protocol" build
+          pnpm --filter "@electric-sql/pglite" build
+          test -f packages/pglite/dist/index.js || { echo "::error::pglite JS build produced no dist/index.js"; exit 1; }
+          test -f packages/pglite/dist/pglite.wasm || { echo "::error::our wasm did not reach dist/"; exit 1; }
+          # Confirm dist carries OUR wasm, not one from npm.
+          cmp packages/pglite/dist/pglite.wasm ../bundle/pglite.wasm
+          cmp packages/pglite/dist/pglite.data ../bundle/pglite.data
 
       - name: Assemble the site
         run: |
@@ -228,7 +246,7 @@ jobs:
         run: node site/verify.mjs site/pglite
 
       - name: Upload the preview site
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: demo-site
           path: site
@@ -266,7 +284,7 @@ jobs:
           echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
           echo "Preview path: $SLUG"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: gh-pages
           path: pages
@@ -280,7 +298,7 @@ jobs:
             git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: demo-site
           path: incoming
@@ -325,7 +343,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pglite-wasm32
           path: bundle
@@ -336,13 +354,79 @@ jobs:
           tar -C bundle -czf "pglite-wasm32-${TAG}.tar.gz" .
           ls -l bundle/pglite.wasm bundle/pglite.data "pglite-wasm32-${TAG}.tar.gz"
 
+      - name: Write the release notes
+        run: |
+          WASM_SIZE=$(du -h bundle/pglite.wasm | cut -f1)
+          DATA_SIZE=$(du -h bundle/pglite.data | cut -f1)
+          TAR_SIZE=$(du -h "pglite-wasm32-${GITHUB_REF_NAME}.tar.gz" | cut -f1)
+          cat > RELEASE-NOTES.md <<NOTES
+          ## What this is
+
+          A wasm32 build of this Postgres fork, for loading in a browser or in Node.
+
+          | | |
+          | --- | --- |
+          | Postgres version | ${{ needs.build-wasm.outputs.pg_version }} |
+          | Built from | \`${{ needs.build-wasm.outputs.build_ref }}\` @ \`${{ needs.build-wasm.outputs.build_sha }}\` |
+          | Built by | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+          | Toolchain | \`${{ env.BUILDER_IMAGE }}\` (emscripten 3.1.74) |
+          | \`pglite.wasm\` | ${WASM_SIZE} |
+          | \`pglite.data\` | ${DATA_SIZE} |
+          | Full bundle | ${TAR_SIZE} |
+
+          The build ref matters: the repository's default branch, \`REL_18_3-pglite\`,
+          is Postgres 18.3 and has **no SQL/PGQ at all**. This bundle is cut from the
+          PG19 branch, which carries the SQL/PGQ patch set. See #10 for the re-pin to
+          \`REL_19_0\` at GA.
+
+          ## SQL/PGQ support level
+
+          Supported: \`CREATE\`/\`ALTER\`/\`DROP PROPERTY GRAPH\`; \`GRAPH_TABLE\` with
+          multi-element path patterns, both edge directions, the vertex-to-vertex
+          abbreviation \`(a)->(b)\`, label disjunction (\`IS a | b\`), per-element
+          \`WHERE\`, lateral references, and \`COLUMNS\` projections composing with
+          ordinary SQL.
+
+          Not supported, each raising a clear error: element pattern quantifiers
+          (\`->{1,2}\`), more than one path pattern per \`GRAPH_TABLE\` clause, adjacent
+          vertex patterns, non-local element variable references, and reusing one
+          variable name with different label expressions.
+
+          ## Emscripten flags
+
+          Linked with \`-sUSE_PTHREADS=0\`, so \`SharedArrayBuffer\` is unused and
+          consumers need **no COOP/COEP headers** and no \`coi-serviceworker\`. Also
+          \`-sMAIN_MODULE=2 -sMODULARIZE=1 -sEXPORT_ES6=1 -sWASM_BIGINT\`,
+          \`-sSUPPORT_LONGJMP=emscripten\`, \`-sIMPORTED_MEMORY=1\`,
+          \`-sINITIAL_MEMORY=128MB\`, \`-sSTACK_SIZE=8MB\`,
+          \`-sALLOW_MEMORY_GROWTH\`, \`-sENVIRONMENT=node,web,worker\`.
+
+          ## Assets, and how to consume them
+
+          \`pglite.wasm\` and \`pglite.data\` **are not loadable on their own.** PGlite's
+          emscripten glue size-checks the FS bundle against a value fixed at link
+          time, so the published \`@electric-sql/pglite\` npm package rejects any
+          \`pglite.data\` but the one it shipped with. Take the full
+          \`pglite-wasm32-*.tar.gz\`, which also carries the matching \`pglite.js\` glue
+          and the \`initdb\` module, and build the PGlite JS runtime against it — the
+          same thing \`.github/workflows/pglite-wasm.yml\` does.
+
+          All assets download anonymously; no token is required.
+          NOTES
+          cat RELEASE-NOTES.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload assets to the existing release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Uploads assets to a release the owner has already created for this
+          # tag. It deliberately does not create or publish the release, and it
+          # does not overwrite the release body — RELEASE-NOTES.md is attached
+          # as an asset and printed to the job summary for the owner to use.
           gh release upload "${GITHUB_REF_NAME}" \
             bundle/pglite.wasm \
             bundle/pglite.data \
             bundle/pglite.js \
+            RELEASE-NOTES.md \
             "pglite-wasm32-${GITHUB_REF_NAME}.tar.gz" \
             --clobber --repo "${{ github.repository }}"
