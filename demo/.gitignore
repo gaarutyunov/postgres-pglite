@@ -1,0 +1,9 @@
+# The repository root .gitignore carries `*.js` because upstream Postgres treats
+# JavaScript as a build artefact. Everything under demo/ is hand-written source,
+# so re-include it here.
+!*.js
+
+# Build output: the PGlite JS runtime compiled against this fork's wasm, plus
+# the wasm bundle itself. Produced by .github/workflows/wasm-demo.yml.
+/pglite/
+/build-info.json
