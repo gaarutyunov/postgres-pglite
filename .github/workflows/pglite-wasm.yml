@@ -1,0 +1,316 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: PGlite wasm32 build and SQL/PGQ demo
+
+# Builds the wasm32 bundle of this fork, proves it executes SQL/PGQ, publishes a
+# per-PR preview of the demo, and — only when a tag is pushed — attaches the
+# bundle to the matching GitHub Release.
+#
+# NOTE ON `build_ref`: the wasm bundle is built from `REL_19_BETA2-pglite`, not
+# from the branch this workflow file lives on. PG19 plus the SQL/PGQ patch set
+# (propgraphcmds.c, parse_graphtable.c, rewriteGraphTable.c, the pg_propgraph_*
+# catalogs and the GRAPH_TABLE grammar) exists only on that branch. The
+# repository's default branch, REL_18_3-pglite, is Postgres 18.3 and has no
+# SQL/PGQ whatsoever, so a bundle built from it cannot run a single query in
+# demo/demo.sql. verify.mjs asserts the server reports PostgreSQL 19 precisely
+# so that mistake cannot pass silently.
+
+on:
+  pull_request:
+  push:
+    tags:
+      - 'pglite-wasm-*'
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: 'Git ref of the fork to build (must carry PG19 + SQL/PGQ)'
+        required: false
+        default: 'REL_19_BETA2-pglite'
+
+permissions:
+  contents: read
+
+concurrency:
+  # The wasm build takes tens of minutes; never let two runs of the same branch
+  # queue up behind each other.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFAULT_BUILD_REF: REL_19_BETA2-pglite
+  # PGlite's JS runtime is pinned: its emscripten glue must come from OUR build
+  # (the glue hard-checks the FS bundle's byte length against a value baked in
+  # at link time), so we build the package from source against our artefacts
+  # rather than using the published npm bundle.
+  PGLITE_JS_REPO: electric-sql/pglite
+  PGLITE_JS_REF: 6b6f28d2592adeb625a1a62b8008630959440765
+  BUILDER_IMAGE: electricsql/pglite-builder:3.1.74-7
+
+jobs:
+  build-wasm:
+    name: Build wasm32 bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      build_ref: ${{ steps.ref.outputs.ref }}
+      build_sha: ${{ steps.ref.outputs.sha }}
+      pg_version: ${{ steps.ref.outputs.pg_version }}
+    steps:
+      - name: Resolve the ref to build
+        id: ref
+        run: |
+          REF="${{ github.event.inputs.build_ref || env.DEFAULT_BUILD_REF }}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the fork at ${{ steps.ref.outputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          path: fork
+          fetch-depth: 1
+
+      - name: Record the exact commit and Postgres version
+        id: stamp
+        working-directory: fork
+        run: |
+          SHA=$(git rev-parse HEAD)
+          PGV=$(sed -n 's/^AC_INIT(\[PostgreSQL\], \[\([^]]*\)\].*/\1/p' configure.ac | head -1)
+          echo "sha=$SHA"        >> "$GITHUB_OUTPUT"
+          echo "pg_version=$PGV" >> "$GITHUB_OUTPUT"
+          echo "Building PostgreSQL $PGV from ${{ steps.ref.outputs.ref }} @ $SHA"
+
+      - name: Fail fast if the ref has no SQL/PGQ
+        working-directory: fork
+        run: |
+          missing=0
+          for f in \
+            src/backend/commands/propgraphcmds.c \
+            src/backend/parser/parse_graphtable.c \
+            src/backend/rewrite/rewriteGraphTable.c \
+            src/include/catalog/pg_propgraph_element.h
+          do
+            if [ ! -f "$f" ]; then echo "::error::missing SQL/PGQ source: $f"; missing=1; fi
+          done
+          if ! grep -q 'GRAPH_TABLE' src/backend/parser/gram.y; then
+            echo "::error::gram.y has no GRAPH_TABLE production"; missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::ref '${{ steps.ref.outputs.ref }}' does not carry SQL/PGQ; refusing to build a bundle that cannot run the demo"
+            exit 1
+          fi
+
+      - name: Pull the emscripten builder image
+        run: docker pull "$BUILDER_IMAGE"
+
+      - name: Bound make's parallelism
+        working-directory: fork
+        run: |
+          # build-pglite.sh hardcodes a bare `-j`, which to GNU make means
+          # "unlimited". Emscripten's emcc peaks around 200-400 MB per process,
+          # so a directory with a hundred sources will try to allocate more than
+          # any runner has. This was not theoretical: an unbounded build was
+          # OOM-killed at src/backend/access/brin. Pin it to the CPU count.
+          #
+          # MAKEFLAGS cannot fix this: an explicit `-j` on the command line
+          # wins, so the script itself has to be rewritten. Worth fixing at
+          # source on the fork branch; done here so the workflow does not
+          # depend on that landing first.
+          export JOBS=$(nproc)
+          perl -pi -e 's/ -j(?=\s|$)/ -j$ENV{JOBS}/g if /emmake make/' build-pglite.sh
+          echo "make parallelism set to ${JOBS}:"
+          grep -n 'emmake make' build-pglite.sh
+          if grep -qE 'emmake make.* -j( |$)' build-pglite.sh; then
+            echo "::error::an unbounded -j survived the rewrite"; exit 1
+          fi
+
+      - name: Build
+        working-directory: fork
+        run: |
+          mkdir -p dist
+          # build-with-docker.sh mounts ./dist at /pglite, which is the
+          # --prefix the build installs into.
+          ./build-with-docker.sh
+
+      - name: Collect the bundle
+        id: collect
+        working-directory: fork
+        run: |
+          test -f dist/bin/pglite.wasm || { echo "::error::no pglite.wasm produced"; exit 1; }
+          test -f dist/bin/pglite.data || { echo "::error::no pglite.data produced"; exit 1; }
+          test -f dist/bin/pglite.js   || { echo "::error::no pglite.js produced";   exit 1; }
+
+          mkdir -p ../bundle
+          cp dist/bin/pglite.js dist/bin/pglite.wasm dist/bin/pglite.data ../bundle/
+          # initdb is a separate emscripten module; PGlite runs it once to
+          # create the in-memory data directory, so the bundle is unusable
+          # without it.
+          cp dist/bin/initdb.js dist/bin/initdb.wasm ../bundle/ 2>/dev/null || \
+            echo "::warning::no separate initdb module in this build"
+          mkdir -p ../bundle/extensions
+          cp dist/extensions/*.tar.gz ../bundle/extensions/ 2>/dev/null || true
+
+          ls -l ../bundle
+          du -sh ../bundle
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: pglite-wasm32
+          path: bundle
+          retention-days: 30
+          if-no-files-found: error
+
+  demo:
+    name: Build demo and prove SQL/PGQ executes
+    needs: build-wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out this branch (the demo sources)
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+
+      - name: Download the wasm bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: pglite-wasm32
+          path: bundle
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check out the PGlite JS runtime
+        run: |
+          git clone --filter=blob:none "https://github.com/${PGLITE_JS_REPO}.git" pglite-js
+          cd pglite-js
+          git checkout "$PGLITE_JS_REF"
+
+      - name: Build the JS runtime against OUR wasm
+        run: |
+          npm install -g pnpm@9
+          mkdir -p pglite-js/packages/pglite/release
+          # These are exactly the files pglite's own `wasm:copy-pglite` /
+          # `wasm:copy-initdb` scripts take from postgres-pglite/dist/bin.
+          cp bundle/pglite.js bundle/pglite.wasm bundle/pglite.data pglite-js/packages/pglite/release/
+          cp bundle/initdb.js bundle/initdb.wasm pglite-js/packages/pglite/release/ 2>/dev/null || true
+          cp bundle/extensions/*.tar.gz pglite-js/packages/pglite/release/ 2>/dev/null || true
+          cd pglite-js
+          pnpm install --frozen-lockfile
+          pnpm --filter @electric-sql/pglite build:js
+
+      - name: Assemble the site
+        run: |
+          mkdir -p site
+          cp repo/demo/index.html repo/demo/app.js repo/demo/worker.js \
+             repo/demo/style.css repo/demo/demo.sql repo/demo/verify.mjs site/
+          cp -r pglite-js/packages/pglite/dist site/pglite
+          cat > site/build-info.json <<JSON
+          {
+            "ref": "${{ needs.build-wasm.outputs.build_ref }}",
+            "sha": "${{ needs.build-wasm.outputs.build_sha }}",
+            "pg_version": "${{ needs.build-wasm.outputs.pg_version }}",
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          JSON
+          du -sh site site/pglite
+
+      - name: Prove the engine executes GRAPH_TABLE (headless)
+        run: node site/verify.mjs site/pglite
+
+      - name: Upload the preview site
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-site
+          path: site
+          retention-days: 30
+          if-no-files-found: error
+
+  preview:
+    name: Publish PR preview
+    needs: demo
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: pages
+        continue-on-error: true
+
+      - name: Prepare the gh-pages checkout
+        run: |
+          if [ ! -d pages/.git ]; then
+            mkdir -p pages && cd pages
+            git init -b gh-pages
+            git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: demo-site
+          path: incoming
+
+      - name: Place the preview under pr-${{ github.event.number }}/
+        run: |
+          rm -rf "pages/pr-${{ github.event.number }}"
+          mkdir -p "pages/pr-${{ github.event.number }}"
+          cp -r incoming/. "pages/pr-${{ github.event.number }}/"
+          # Jekyll would swallow files and directories beginning with an
+          # underscore, which emscripten output can contain.
+          touch pages/.nojekyll
+
+      - name: Push
+        working-directory: pages
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "preview: PR #${{ github.event.number }} @ ${{ github.sha }}" || {
+            echo "nothing to publish"; exit 0;
+          }
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
+
+      - name: Report the preview URL
+        run: |
+          OWNER=$(echo "${{ github.repository }}" | cut -d/ -f1)
+          NAME=$(echo "${{ github.repository }}" | cut -d/ -f2)
+          echo "### SQL/PGQ demo preview" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://${OWNER}.github.io/${NAME}/pr-${{ github.event.number }}/" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "(GitHub Pages must be enabled for this repository with the \`gh-pages\` branch as its source.)" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Attach the bundle to the release
+    needs: [build-wasm, demo]
+    if: startsWith(github.ref, 'refs/tags/pglite-wasm-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pglite-wasm32
+          path: bundle
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          tar -C bundle -czf "pglite-wasm32-${TAG}.tar.gz" .
+          ls -l bundle/pglite.wasm bundle/pglite.data "pglite-wasm32-${TAG}.tar.gz"
+
+      - name: Upload assets to the existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            bundle/pglite.wasm \
+            bundle/pglite.data \
+            bundle/pglite.js \
+            "pglite-wasm32-${GITHUB_REF_NAME}.tar.gz" \
+            --clobber --repo "${{ github.repository }}"
