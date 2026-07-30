@@ -185,6 +185,7 @@ fetch('./build-info.json')
   .then((r) => (r.ok ? r.json() : null))
   .then((info) => {
     if (!info) return
-    document.getElementById('fact-ref').textContent = `${info.ref} @ ${info.sha.slice(0, 10)}`
+    const sha = info.sha ? ` @ ${info.sha.slice(0, 10)}` : ''
+    document.getElementById('fact-ref').textContent = `${info.ref}${sha}`
   })
   .catch(() => {})

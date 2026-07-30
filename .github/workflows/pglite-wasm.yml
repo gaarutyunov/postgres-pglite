@@ -59,8 +59,9 @@ jobs:
     timeout-minutes: 300
     outputs:
       build_ref: ${{ steps.ref.outputs.ref }}
-      build_sha: ${{ steps.ref.outputs.sha }}
-      pg_version: ${{ steps.ref.outputs.pg_version }}
+      # sha and pg_version come from the `stamp` step, not `ref`.
+      build_sha: ${{ steps.stamp.outputs.sha }}
+      pg_version: ${{ steps.stamp.outputs.pg_version }}
     steps:
       - name: Resolve the ref to build
         id: ref
@@ -241,6 +242,17 @@ jobs:
             "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           }
           JSON
+          # An empty field here means a broken step reference upstream, which
+          # is exactly how the sha and pg_version silently went missing once.
+          python3 - <<'PY'
+          import json, sys
+          info = json.load(open('site/build-info.json'))
+          missing = [k for k in ('ref', 'sha', 'pg_version') if not info.get(k)]
+          if missing:
+              print(f"::error::build-info.json has empty field(s): {', '.join(missing)}")
+              sys.exit(1)
+          print('build-info.json:', info)
+          PY
           du -sh site site/pglite
 
       - name: Prove the engine executes GRAPH_TABLE (Node)
