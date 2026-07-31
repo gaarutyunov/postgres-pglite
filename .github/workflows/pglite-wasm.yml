@@ -1,0 +1,576 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: PGlite wasm32 build and SQL/PGQ demo
+
+# Builds the wasm32 bundle of this fork, proves it executes SQL/PGQ, publishes a
+# per-PR preview of the demo, and — only when a tag is pushed — attaches the
+# bundle to the matching GitHub Release.
+#
+# NOTE ON `build_ref`: the wasm bundle is built from `REL_19_BETA2-pglite`, not
+# from the branch this workflow file lives on. PG19 plus the SQL/PGQ patch set
+# (propgraphcmds.c, parse_graphtable.c, rewriteGraphTable.c, the pg_propgraph_*
+# catalogs and the GRAPH_TABLE grammar) exists only on that branch. The
+# repository's default branch, REL_18_3-pglite, is Postgres 18.3 and has no
+# SQL/PGQ whatsoever, so a bundle built from it cannot run a single query in
+# demo/demo.sql. verify.mjs asserts the server reports PostgreSQL 19 precisely
+# so that mistake cannot pass silently.
+#
+# NO "RUN WORKFLOW" BUTTON, AND WHY: this file lives on REL_19_BETA2-pglite, not
+# on the repository's default branch. GitHub only surfaces `workflow_dispatch`
+# for workflows present on the *default* branch, so the Actions UI will show no
+# manual-run button for this workflow and the `build_ref` input below is not
+# reachable from the UI. This is expected, not a misconfiguration.
+#
+# What still works meanwhile: every push to REL_19_BETA2-pglite or an issue-**
+# branch triggers a full build, demo and preview automatically, and pushing a
+# `pglite-wasm-*` tag still runs the release path. Only *choosing a different
+# build_ref by hand* is unavailable.
+#
+# It resolves itself when postgres-pglite#10 re-pins the fork at PG19 GA and 19
+# becomes the default branch; the dispatch button then appears with no change
+# to this file.
+
+on:
+  # This repository is a fork, and every workflow run it has ever had came from
+  # a `push` event — a `pull_request` push to a branch here produced no run at
+  # all. So `push` is the trigger that is actually known to work; the
+  # `pull_request` entry is kept because it costs nothing if it does fire.
+  push:
+    branches:
+      - 'issue-**'
+      - 'REL_19_BETA2-pglite'
+    tags:
+      - 'pglite-wasm-*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: 'Git ref of the fork to build (must carry PG19 + SQL/PGQ)'
+        required: false
+        default: 'REL_19_BETA2-pglite'
+
+permissions:
+  contents: read
+
+concurrency:
+  # The wasm build takes tens of minutes; never let two runs of the same branch
+  # queue up behind each other.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFAULT_BUILD_REF: REL_19_BETA2-pglite
+  # PGlite's JS runtime is pinned: its emscripten glue must come from OUR build
+  # (the glue hard-checks the FS bundle's byte length against a value baked in
+  # at link time), so we build the package from source against our artefacts
+  # rather than using the published npm bundle.
+  PGLITE_JS_REPO: electric-sql/pglite
+  PGLITE_JS_REF: 6b6f28d2592adeb625a1a62b8008630959440765
+  BUILDER_IMAGE: electricsql/pglite-builder:3.1.74-7
+
+jobs:
+  build-wasm:
+    name: Build wasm32 bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      build_ref: ${{ steps.ref.outputs.ref }}
+      # sha and pg_version come from the `stamp` step, not `ref`.
+      build_sha: ${{ steps.stamp.outputs.sha }}
+      pg_version: ${{ steps.stamp.outputs.pg_version }}
+    steps:
+      - name: Resolve the ref to build
+        id: ref
+        run: |
+          REF="${{ github.event.inputs.build_ref || env.DEFAULT_BUILD_REF }}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the fork at ${{ steps.ref.outputs.ref }}
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          path: fork
+          fetch-depth: 1
+
+      - name: Record the exact commit and Postgres version
+        id: stamp
+        working-directory: fork
+        run: |
+          SHA=$(git rev-parse HEAD)
+          PGV=$(sed -n 's/^AC_INIT(\[PostgreSQL\], \[\([^]]*\)\].*/\1/p' configure.ac | head -1)
+          echo "sha=$SHA"        >> "$GITHUB_OUTPUT"
+          echo "pg_version=$PGV" >> "$GITHUB_OUTPUT"
+          echo "Building PostgreSQL $PGV from ${{ steps.ref.outputs.ref }} @ $SHA"
+
+      - name: Fail fast if the ref has no SQL/PGQ
+        working-directory: fork
+        run: |
+          missing=0
+          for f in \
+            src/backend/commands/propgraphcmds.c \
+            src/backend/parser/parse_graphtable.c \
+            src/backend/rewrite/rewriteGraphTable.c \
+            src/include/catalog/pg_propgraph_element.h
+          do
+            if [ ! -f "$f" ]; then echo "::error::missing SQL/PGQ source: $f"; missing=1; fi
+          done
+          if ! grep -q 'GRAPH_TABLE' src/backend/parser/gram.y; then
+            echo "::error::gram.y has no GRAPH_TABLE production"; missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::ref '${{ steps.ref.outputs.ref }}' does not carry SQL/PGQ; refusing to build a bundle that cannot run the demo"
+            exit 1
+          fi
+
+      - name: Pull the emscripten builder image
+        run: docker pull "$BUILDER_IMAGE"
+
+      - name: Bound make's parallelism
+        working-directory: fork
+        run: |
+          # build-pglite.sh hardcodes a bare `-j`, which to GNU make means
+          # "unlimited". Emscripten's emcc peaks around 200-400 MB per process,
+          # so a directory with a hundred sources will try to allocate more than
+          # any runner has. This was not theoretical: an unbounded build was
+          # OOM-killed at src/backend/access/brin. Pin it to the CPU count.
+          #
+          # MAKEFLAGS cannot fix this: an explicit `-j` on the command line
+          # wins, so the script itself has to be rewritten. Worth fixing at
+          # source on the fork branch; done here so the workflow does not
+          # depend on that landing first.
+          export JOBS=$(nproc)
+          perl -pi -e 's/ -j(?=\s|$)/ -j$ENV{JOBS}/g if /emmake make/' build-pglite.sh
+          echo "make parallelism set to ${JOBS}:"
+          grep -n 'emmake make' build-pglite.sh
+          if grep -qE 'emmake make.* -j( |$)' build-pglite.sh; then
+            echo "::error::an unbounded -j survived the rewrite"; exit 1
+          fi
+
+      - name: Build
+        working-directory: fork
+        run: |
+          mkdir -p dist
+          # build-with-docker.sh mounts ./dist at /pglite, which is the
+          # --prefix the build installs into.
+          ./build-with-docker.sh
+
+      - name: Collect the bundle
+        id: collect
+        working-directory: fork
+        run: |
+          test -f dist/bin/pglite.wasm || { echo "::error::no pglite.wasm produced"; exit 1; }
+          test -f dist/bin/pglite.data || { echo "::error::no pglite.data produced"; exit 1; }
+          test -f dist/bin/pglite.js   || { echo "::error::no pglite.js produced";   exit 1; }
+
+          # initdb is a separate emscripten module. PGlite runs it once to
+          # create the data directory, and packages/pglite/src/initdbModFactory.ts
+          # imports ../release/initdb at *build* time, so a missing initdb.js
+          # breaks the JS build rather than failing later at runtime.
+          test -f dist/bin/initdb.wasm || { echo "::error::no initdb.wasm produced"; exit 1; }
+          test -f dist/bin/initdb.js   || { echo "::error::no initdb.js produced";   exit 1; }
+
+          mkdir -p ../bundle
+          cp dist/bin/pglite.js dist/bin/pglite.wasm dist/bin/pglite.data ../bundle/
+          cp dist/bin/initdb.js dist/bin/initdb.wasm ../bundle/
+          mkdir -p ../bundle/extensions
+          cp dist/extensions/*.tar.gz ../bundle/extensions/ 2>/dev/null || true
+
+          ls -l ../bundle
+          du -sh ../bundle
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: pglite-wasm32
+          path: bundle
+          retention-days: 30
+          if-no-files-found: error
+
+  demo:
+    name: Build demo and prove SQL/PGQ executes
+    needs: build-wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out this branch (the demo sources)
+        uses: actions/checkout@v5
+        with:
+          path: repo
+          fetch-depth: 1
+
+      - name: Download the wasm bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: pglite-wasm32
+          path: bundle
+
+      - uses: pnpm/action-setup@v5
+        with:
+          # Matches the `packageManager` field in pglite's root package.json.
+          version: 9.7.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Check out the PGlite JS runtime
+        run: |
+          git clone --filter=blob:none "https://github.com/${PGLITE_JS_REPO}.git" pglite-js
+          cd pglite-js
+          git checkout "$PGLITE_JS_REF"
+
+      - name: Build the JS runtime against OUR wasm
+        run: |
+          mkdir -p pglite-js/packages/pglite/release
+          # These are exactly the files pglite's own `wasm:copy-pglite` /
+          # `wasm:copy-initdb` scripts take from postgres-pglite/dist/bin.
+          cp bundle/pglite.js bundle/pglite.wasm bundle/pglite.data pglite-js/packages/pglite/release/
+          cp bundle/initdb.js bundle/initdb.wasm pglite-js/packages/pglite/release/
+          # contrib bundles are runtime-only (referenced by URL, not imported),
+          # so the demo builds fine without them.
+          cp bundle/extensions/*.tar.gz pglite-js/packages/pglite/release/ 2>/dev/null || true
+          cd pglite-js
+          pnpm install --frozen-lockfile
+          # Same order pglite's own CI uses: the two workspace dependencies
+          # first, then pglite itself.
+          pnpm --filter "@electric-sql/pglite-utils" build
+          pnpm --filter "@electric-sql/pg-protocol" build
+          pnpm --filter "@electric-sql/pglite" build
+          test -f packages/pglite/dist/index.js || { echo "::error::pglite JS build produced no dist/index.js"; exit 1; }
+          test -f packages/pglite/dist/initdb.wasm || { echo "::error::initdb did not reach dist/"; exit 1; }
+          test -f packages/pglite/dist/pglite.wasm || { echo "::error::our wasm did not reach dist/"; exit 1; }
+          # Confirm dist carries OUR wasm, not one from npm.
+          cmp packages/pglite/dist/pglite.wasm ../bundle/pglite.wasm
+          cmp packages/pglite/dist/pglite.data ../bundle/pglite.data
+
+      - name: Pack the npm tarball
+        run: |
+          # The consumer (gopgql#31, spec workspace#45 D1) pins this as a URL
+          # dependency in package.json so that `import { PGlite } from
+          # '@electric-sql/pglite'` keeps working unchanged. Raw .wasm + FS
+          # assets are explicitly NOT enough: something has to own the
+          # emscripten instantiation, the wire protocol and result decoding.
+          # So the package name stays exactly as upstream; only the version is
+          # marked, to make it obvious this is the PG19 fork build.
+          mkdir -p "$GITHUB_WORKSPACE/npm"
+          cd pglite-js/packages/pglite
+          VERSION="$(node -p "require('./package.json').version")-pg19beta2"
+          npm version --no-git-tag-version --allow-same-version "$VERSION"
+          npm pack --pack-destination "$GITHUB_WORKSPACE/npm"
+          ls -l "$GITHUB_WORKSPACE/npm"
+          test -n "$(ls -A "$GITHUB_WORKSPACE/npm"/*.tgz 2>/dev/null)" || {
+            echo "::error::npm pack produced no tarball"; exit 1; }
+
+      - name: Upload the npm tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: pglite-npm-package
+          path: npm
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Assemble the site
+        run: |
+          mkdir -p site
+          cp repo/demo/index.html repo/demo/app.js repo/demo/worker.js \
+             repo/demo/style.css repo/demo/demo.sql repo/demo/verify.mjs \
+             repo/demo/browser-check.py site/
+          cp -r pglite-js/packages/pglite/dist site/pglite
+          cat > site/build-info.json <<JSON
+          {
+            "ref": "${{ needs.build-wasm.outputs.build_ref }}",
+            "sha": "${{ needs.build-wasm.outputs.build_sha }}",
+            "pg_version": "${{ needs.build-wasm.outputs.pg_version }}",
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflow_run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          JSON
+          # An empty field here means a broken step reference upstream, which
+          # is exactly how the sha and pg_version silently went missing once.
+          python3 - <<'PY'
+          import json, sys
+          info = json.load(open('site/build-info.json'))
+          missing = [k for k in ('ref', 'sha', 'pg_version') if not info.get(k)]
+          if missing:
+              print(f"::error::build-info.json has empty field(s): {', '.join(missing)}")
+              sys.exit(1)
+          print('build-info.json:', info)
+          PY
+          du -sh site site/pglite
+
+      - name: Prove the engine executes GRAPH_TABLE (Node)
+        run: node site/verify.mjs site/pglite
+
+      - name: Prove it again in a real browser
+        run: |
+          # Node and the browser are different paths — the browser adds module
+          # workers, fetch and browser WebAssembly instantiation — and the
+          # browser is the one issue #28 actually asks about. Serve the site
+          # exactly as the preview will, with no special headers, which also
+          # demonstrates that -sUSE_PTHREADS=0 leaves COOP/COEP unnecessary.
+          (cd site && python3 -m http.server 8899 >/dev/null 2>&1 &)
+          for _ in $(seq 1 20); do
+            curl -sf http://localhost:8899/ >/dev/null && break
+            sleep 1
+          done
+          python3 site/browser-check.py http://localhost:8899/
+
+      - name: Upload the preview site
+        uses: actions/upload-artifact@v7
+        with:
+          name: demo-site
+          path: site
+          retention-days: 30
+          if-no-files-found: error
+
+  preview:
+    name: Publish preview
+    needs: demo
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Work out where the preview goes
+        id: slug
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # On a pull_request run the PR number is handed to us. On a push run
+          # it is not, so ask for the PR whose head is this branch; if there
+          # isn't one, fall back to the branch name.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SLUG="pr-${{ github.event.number }}"
+          else
+            PR=$(gh pr list --repo "${{ github.repository }}" \
+                   --head "${{ github.ref_name }}" --state open \
+                   --json number --jq '.[0].number // empty')
+            if [ -n "$PR" ]; then
+              SLUG="pr-${PR}"
+            else
+              SLUG="branch-$(echo "${{ github.ref_name }}" | tr -c 'A-Za-z0-9._-' '-')"
+            fi
+          fi
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "Preview path: $SLUG"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: gh-pages
+          path: pages
+        continue-on-error: true
+
+      - name: Prepare the gh-pages checkout
+        run: |
+          if [ ! -d pages/.git ]; then
+            mkdir -p pages && cd pages
+            git init -b gh-pages
+            git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: demo-site
+          path: incoming
+
+      - name: Place the preview under ${{ steps.slug.outputs.slug }}/
+        run: |
+          rm -rf "pages/${{ steps.slug.outputs.slug }}"
+          mkdir -p "pages/${{ steps.slug.outputs.slug }}"
+          cp -r incoming/. "pages/${{ steps.slug.outputs.slug }}/"
+          # Jekyll would swallow files and directories beginning with an
+          # underscore, which emscripten output can contain.
+          touch pages/.nojekyll
+
+      - name: Prune previews for closed PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Each preview carries its own full copy of the runtime, which is the
+          # right call: a preview must exercise the bytes its own run built,
+          # and the copies are nearly free because the build is byte-identical
+          # across runs, so git stores one blob no matter how many previews
+          # reference it (measured: 3 deploys, 1 pglite.wasm blob).
+          #
+          # What is not free is keeping directories for PRs nobody will open
+          # again, so retire them here. gopgql's gh-pages still holds preview
+          # directories for five merged PRs precisely because nothing does this.
+          for dir in pages/pr-*; do
+            [ -d "$dir" ] || continue
+            n="${dir##*/pr-}"
+            state=$(gh pr view "$n" --repo "${{ github.repository }}" --json state --jq .state 2>/dev/null || echo UNKNOWN)
+            if [ "$state" = "CLOSED" ] || [ "$state" = "MERGED" ]; then
+              echo "pruning $dir (PR #$n is $state)"
+              rm -rf "$dir"
+            fi
+          done
+
+      - name: Push
+        working-directory: pages
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "preview: ${{ steps.slug.outputs.slug }} @ ${{ github.sha }}" || {
+            echo "nothing to publish"; exit 0;
+          }
+          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:gh-pages
+
+      - name: Report the preview URL
+        run: |
+          OWNER=$(echo "${{ github.repository }}" | cut -d/ -f1)
+          NAME=$(echo "${{ github.repository }}" | cut -d/ -f2)
+          {
+            echo "### SQL/PGQ demo preview"
+            echo ""
+            echo "https://${OWNER}.github.io/${NAME}/${{ steps.slug.outputs.slug }}/"
+            echo ""
+            echo "(GitHub Pages must be enabled for this repository with the \`gh-pages\` branch as its source.)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Attach the bundle to the release
+    needs: [build-wasm, demo]
+    if: startsWith(github.ref, 'refs/tags/pglite-wasm-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: pglite-wasm32
+          path: bundle
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: pglite-npm-package
+          path: npm
+
+      - name: Package
+        id: pkg
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          tar -C bundle -czf "pglite-wasm32-${TAG}.tar.gz" .
+          TGZ=$(basename "$(ls npm/*.tgz | head -1)")
+          cp "npm/$TGZ" "./$TGZ"
+          cp bundle/pglite.wasm bundle/pglite.data bundle/pglite.js .
+          echo "tgz=$TGZ" >> "$GITHUB_OUTPUT"
+          ls -l pglite.wasm pglite.data "pglite-wasm32-${TAG}.tar.gz" "$TGZ"
+
+      - name: Publish checksums
+        run: |
+          # The consumer verifies the download against this before installing,
+          # so every published asset gets a line. Names are passed bare, never
+          # as ./x, so the two-space `sha256sum -c` format stays intact.
+          sha256sum \
+            pglite.wasm \
+            pglite.data \
+            pglite.js \
+            "pglite-wasm32-${GITHUB_REF_NAME}.tar.gz" \
+            "${{ steps.pkg.outputs.tgz }}" > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Write the release notes
+        run: |
+          WASM_SIZE=$(du -h bundle/pglite.wasm | cut -f1)
+          DATA_SIZE=$(du -h bundle/pglite.data | cut -f1)
+          TAR_SIZE=$(du -h "pglite-wasm32-${GITHUB_REF_NAME}.tar.gz" | cut -f1)
+          cat > RELEASE-NOTES.md <<NOTES
+          ## What this is
+
+          A wasm32 build of this Postgres fork, for loading in a browser or in Node.
+
+          | | |
+          | --- | --- |
+          | Postgres version | ${{ needs.build-wasm.outputs.pg_version }} |
+          | Built from | \`${{ needs.build-wasm.outputs.build_ref }}\` @ \`${{ needs.build-wasm.outputs.build_sha }}\` |
+          | Built by | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+          | Toolchain | \`${{ env.BUILDER_IMAGE }}\` (emscripten 3.1.74) |
+          | \`pglite.wasm\` | ${WASM_SIZE} |
+          | \`pglite.data\` | ${DATA_SIZE} |
+          | Full bundle | ${TAR_SIZE} |
+
+          The build ref matters: the repository's default branch, \`REL_18_3-pglite\`,
+          is Postgres 18.3 and has **no SQL/PGQ at all**. This bundle is cut from the
+          PG19 branch, which carries the SQL/PGQ patch set. See #10 for the re-pin to
+          \`REL_19_0\` at GA.
+
+          ## SQL/PGQ support level
+
+          Supported: \`CREATE\`/\`ALTER\`/\`DROP PROPERTY GRAPH\`; \`GRAPH_TABLE\` with
+          multi-element path patterns, both edge directions, the vertex-to-vertex
+          abbreviation \`(a)->(b)\`, label disjunction (\`IS a | b\`), per-element
+          \`WHERE\`, lateral references, and \`COLUMNS\` projections composing with
+          ordinary SQL.
+
+          Not supported, each raising a clear error: element pattern quantifiers
+          (\`->{1,2}\`), more than one path pattern per \`GRAPH_TABLE\` clause, adjacent
+          vertex patterns, non-local element variable references, and reusing one
+          variable name with different label expressions.
+
+          ## Emscripten flags
+
+          Linked with \`-sUSE_PTHREADS=0\`, so \`SharedArrayBuffer\` is unused and
+          consumers need **no COOP/COEP headers** and no \`coi-serviceworker\`. Also
+          \`-sMAIN_MODULE=2 -sMODULARIZE=1 -sEXPORT_ES6=1 -sWASM_BIGINT\`,
+          \`-sSUPPORT_LONGJMP=emscripten\`, \`-sIMPORTED_MEMORY=1\`,
+          \`-sINITIAL_MEMORY=128MB\`, \`-sSTACK_SIZE=8MB\`,
+          \`-sALLOW_MEMORY_GROWTH\`, \`-sENVIRONMENT=node,web,worker\`.
+
+          ## Assets, and how to consume them
+
+          **Pin the \`.tgz\`.** It is an npm package tarball of
+          \`@electric-sql/pglite\` — the package name is unchanged, so
+          \`import { PGlite } from '@electric-sql/pglite'\` is a drop-in — built
+          against this fork's wasm, with the JS runtime that owns the emscripten
+          instantiation, the wire protocol and result decoding:
+
+          \`\`\`json
+          "@electric-sql/pglite": "<the .tgz asset URL from this release>"
+          \`\`\`
+
+          \`pglite.wasm\` and \`pglite.data\` are published for inspection but
+          **are not loadable on their own.** PGlite's emscripten glue size-checks
+          the FS bundle against a value fixed at link time, so the upstream npm
+          package rejects any \`pglite.data\` but the one it shipped with. Using the
+          raw assets means hand-instantiating them; the \`.tgz\` exists so nobody
+          has to.
+
+          Verify before installing:
+
+          \`\`\`sh
+          sha256sum -c SHA256SUMS
+          \`\`\`
+
+          All assets download anonymously over plain HTTPS; no token is required.
+
+          ## Reproducibility
+
+          The build is byte-deterministic. Four independent CI runs of this
+          workflow, on different runners, produced identical \`pglite.wasm\` and
+          \`pglite.data\` — verified by sha256 and by \`gh-pages\` storing a single
+          git blob across all deploys. Rebuilding from the same ref should
+          reproduce the checksums above; if it does not, treat that as a bug.
+
+          Known trap: \`SELECT version()\` on a fork build carries **no**
+          \`PGlite x.y.z\` suffix. Do not assert that pattern.
+          NOTES
+          cat RELEASE-NOTES.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload assets to the existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Uploads assets to a release the owner has already created for this
+          # tag. It deliberately does not create or publish the release, and it
+          # does not overwrite the release body — RELEASE-NOTES.md is attached
+          # as an asset and printed to the job summary for the owner to use.
+          gh release upload "${GITHUB_REF_NAME}" \
+            bundle/pglite.wasm \
+            bundle/pglite.data \
+            bundle/pglite.js \
+            SHA256SUMS \
+            RELEASE-NOTES.md \
+            "pglite-wasm32-${GITHUB_REF_NAME}.tar.gz" \
+            "${{ steps.pkg.outputs.tgz }}" \
+            --clobber --repo "${{ github.repository }}"

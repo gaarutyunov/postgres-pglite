@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL/PGQ in the browser — postgres-pglite wasm32</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<header>
+  <h1>SQL/PGQ in the browser</h1>
+  <p class="lede">
+    A wasm32 build of this Postgres fork, booted in a Web Worker and asked to run
+    <code>GRAPH_TABLE</code> queries. Everything below is executed live by the
+    engine in your browser — no server, no mock, no recorded output.
+  </p>
+  <dl class="facts">
+    <dt>Backend</dt><dd id="fact-version">…</dd>
+    <dt>Build ref</dt><dd id="fact-ref">…</dd>
+    <dt>Storage</dt><dd>in-memory only (no IndexedDB, no OPFS)</dd>
+    <dt>Threads</dt><dd><code>-sUSE_PTHREADS=0</code> — no COOP/COEP headers needed</dd>
+  </dl>
+</header>
+
+<section id="boot">
+  <h2>Boot</h2>
+  <ol id="boot-steps"></ol>
+  <pre id="boot-log" hidden></pre>
+</section>
+
+<section id="results">
+  <h2>Statements</h2>
+  <p class="hint">
+    The SQL is <a href="./demo.sql">hand-written</a>. Statements 1–3 create the
+    tables, declare the property graph and seed it; Q1–Q6 are the queries whose
+    output is rendered.
+  </p>
+  <div id="statements"></div>
+</section>
+
+<footer>
+  <p id="verdict" class="pending">Running…</p>
+  <p class="small">
+    Source: <code>demo/</code> in
+    <a href="https://github.com/gaarutyunov/postgres-pglite">gaarutyunov/postgres-pglite</a>.
+  </p>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
