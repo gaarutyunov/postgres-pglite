@@ -1,7 +1,0 @@
-{
-  "ref": "REL_19_BETA2-pglite",
-  "sha": "f13a3a52cde9f65eea0e13857a806ca6ea99ec46",
-  "pg_version": "19beta2",
-  "built_at": "2026-07-30T23:00:02Z",
-  "workflow_run": "https://github.com/gaarutyunov/postgres-pglite/actions/runs/30588568141"
-}
